@@ -10,16 +10,12 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 
-from pf_history import PfHistory
-from utils import gauss_likelihood
+from history import History
+from utils import gauss_likelihood, low_variance_resampling, calculate_covariance
 
 import sys
 sys.path.append('..')
-from localization import BayesFilter
-from simulator import Simulator
-
-
-simulator = Simulator()
+from simulator import ControlModel
 
 
 # Estimation parameter of PF
@@ -40,110 +36,136 @@ NTh = NP / 2.0  # Number of particle for re-sampling
 
 show_animation = True
 
-class ParticleFilter(BayesFilter):
+class MotionModel():
+	
+	def __init__(self):
+		pass
 
-    def __init__(self, DT):
-        super().__init__(DT)
+	def __call__(self, u, mu_past):
+		F = np.array([[1.0, 0, 0, 0],
+                  [0, 1.0, 0, 0],
+                  [0, 0, 1.0, 0],
+                  [0, 0, 0, 0]])
 
-    def observation(self, xTrue, xd, u, RFID):
-        xTrue = self.motion_model(xTrue, u)
+		theta = mu_past[2, 0]
+		B = np.array([[DT * np.cos(theta), 0],
+					[DT * np.sin(theta), 0],
+					[0.0, DT],
+					[1.0, 0.0]])
 
-        # add noise to gps x-y
-        z = np.zeros((0, 3))
+		mu_bar = F @ mu_past + B @ u
+		return mu_bar
 
-        for i in range(len(RFID[:, 0])):
+   
+class ParticleFilter():
 
-            dx = xTrue[0, 0] - RFID[i, 0]
-            dy = xTrue[1, 0] - RFID[i, 1]
-            d = math.sqrt(dx**2 + dy**2)
-            if d <= MAX_RANGE:
-                dn = d + np.random.randn() * Qsim[0, 0]  # add noise
-                zi = np.array([[dn, RFID[i, 0], RFID[i, 1]]])
-                z = np.vstack((z, zi))
-
-        # add noise to input
-        ud1 = u[0, 0] + np.random.randn() * Rsim[0, 0]
-        ud2 = u[1, 0] + np.random.randn() * Rsim[1, 1]
-        ud = np.array([[ud1, ud2]]).T
-
-        xd = self.motion_model(xd, ud)
-
-        return xTrue, z, xd, ud
-
-
-    def calc_covariance(self, xEst, px, pw):
-        cov = np.zeros((3, 3))
-
-        for i in range(px.shape[1]):
-            dx = (px[:, i] - xEst)[0:3]
-            cov += pw[0, i] * dx.dot(dx.T)
-
-        return cov
+	def __init__(self, motion_model, DT, Q, R):
+		self.motion_model = motion_model
+		self.DT = DT
+		self.Q = Q
+		self.R = R
 
 
-    def localization(self, px, pw, xEst, PEst, z, u):
-        """
-        Localization with Particle filter
-        """
+	# Table 4.3
+	def __call__(self, px, pw, mu, sigma, z, u):
+		for i in range(NP): # line 3
+			x_past = np.array([px[:, i]]).T
+			w = pw[0, i]
+			x = self.sample(u, x_past) # line 4
 
-        for ip in range(NP):
-            x = np.array([px[:, ip]]).T
-            w = pw[0, ip]
-            #  Predict with random input sampling
-            ud1 = u[0, 0] + np.random.randn() * Rsim[0, 0]
-            ud2 = u[1, 0] + np.random.randn() * Rsim[1, 1]
-            ud = np.array([[ud1, ud2]]).T
-            x = self.motion_model(x, ud)
+			#  Calc Importance Weight
+			w = pw[0,i]
+			w = self.calculate_importance_weight(z, x, w) # line 5
 
-            #  Calc Importance Weight
-            for i in range(len(z[:, 0])):
-                dx = x[0, 0] - z[i, 1]
-                dy = x[1, 0] - z[i, 2]
-                prez = math.sqrt(dx**2 + dy**2)
-                dz = prez - z[i, 0]
-                w = w * gauss_likelihood(dz, math.sqrt(Q[0, 0]))
+			# line 7
+			px[:, i] = x[:, 0]
+			pw[0, i] = w
 
-            px[:, ip] = x[:, 0]
-            pw[0, ip] = w
+		# lines 8-11
+		pw = pw / pw.sum()  # normalize
+		mu = px.dot(pw.T)
+		sigma = self.calculate_covariance(mu, px, pw)
+		px, pw = self.low_variance_resampling(px, pw)
 
-        pw = pw / pw.sum()  # normalize
+		return mu, sigma, px, pw
 
-        xEst = px.dot(pw.T)
-        PEst = self.calc_covariance(xEst, px, pw)
+	# line 4
+	def sample(self, u, x_past):
+		# add noise to input
+		u1 = u[0, 0] + np.random.randn() * Rsim[0, 0]
+		u2 = u[1, 0] + np.random.randn() * Rsim[1, 1]
+		u = np.array([[u1, u2]]).T
+		
+		#  Predict with random input sampling
+		x = self.motion_model(u, x_past)
+		return x
 
-        px, pw = resampling(px, pw)
+	# line 5
+	def calculate_importance_weight(self, z, x, w):
+		for i in range(len(z[:, 0])):
+			dx = x[0, 0] - z[i, 1]
+			dy = x[1, 0] - z[i, 2]
+			prez = math.sqrt(dx**2 + dy**2)
+			dz = prez - z[i, 0]
+			w = w * gauss_likelihood(dz, math.sqrt(self.Q[0, 0]))
 
-        return xEst, PEst, px, pw
+		return w
 
+	def calculate_covariance(self, mu, px, pw):
+		cov = np.zeros((3, 3))
 
+		for i in range(px.shape[1]):
+			dx = (px[:, i] - mu)[0:3]
+			cov += pw[0, i] * dx.dot(dx.T)
 
-
-
-
-def resampling(px, pw):
-    """
-    low variance re-sampling
-    """
-
-    Neff = 1.0 / (pw.dot(pw.T))[0, 0]  # Effective particle number
-    if Neff < NTh:
-        wcum = np.cumsum(pw)
-        base = np.cumsum(pw * 0.0 + 1 / NP) - 1 / NP
-        resampleid = base + np.random.rand(base.shape[0]) / NP
-
-        inds = []
-        ind = 0
-        for ip in range(NP):
-            while resampleid[ip] > wcum[ind]:
-                ind += 1
-            inds.append(ind)
-
-        px = px[:, inds]
-        pw = np.zeros((1, NP)) + 1.0 / NP  # init weight
-
-    return px, pw
+		return cov
 
 
+	def low_variance_resampling(self, px, pw):
+		Neff = 1.0 / (pw.dot(pw.T))[0, 0]  # Effective particle number
+		if Neff < NTh:
+			wcum = np.cumsum(pw)
+			base = np.cumsum(pw * 0.0 + 1 / NP) - 1 / NP
+			resampleid = base + np.random.rand(base.shape[0]) / NP
+
+			inds = []
+			ind = 0
+			for ip in range(NP):
+				while resampleid[ip] > wcum[ind]:
+					ind += 1
+				inds.append(ind)
+
+			px = px[:, inds]
+			pw = np.zeros((1, NP)) + 1.0 / NP  # init weight
+
+		return px, pw
+
+
+def observation(motion_model, pose, mu, u, RFID):
+
+    pose = motion_model(u, pose)
+
+    # add noise to gps x-y
+    z = np.zeros((0, 3))
+
+    for i in range(len(RFID[:, 0])):
+
+        dx = pose[0, 0] - RFID[i, 0]
+        dy = pose[1, 0] - RFID[i, 1]
+        d = math.sqrt(dx**2 + dy**2)
+        if d <= MAX_RANGE:
+            dn = d + np.random.randn() * Qsim[0, 0]  # add noise
+            zi = np.array([[dn, RFID[i, 0], RFID[i, 1]]])
+            z = np.vstack((z, zi))
+
+    # add noise to input
+    u1 = u[0, 0] + np.random.randn() * Rsim[0, 0]
+    u2 = u[1, 0] + np.random.randn() * Rsim[1, 1]
+    u = np.array([[u1, u2]]).T
+
+    mu = motion_model(u, mu)
+
+    return pose, z, mu, u
 
 def main():
     print(__file__ + " start!!")
@@ -157,31 +179,32 @@ def main():
                      [-5.0, 20.0]])
 
     # State Vector [x y yaw v]'
-    xEst = np.zeros((4, 1))
-    xTrue = np.zeros((4, 1))
-    PEst = np.eye(4)
-    xDR = np.zeros((4, 1))  # Dead reckoning
+    mu = np.zeros((4, 1))
+    pose = np.zeros((4, 1))
+    sigma = np.eye(4)
 
     px = np.zeros((4, NP))  # Particle store
     pw = np.zeros((1, NP)) + 1.0 / NP  # Particle weight
+    xDR = np.zeros((4, 1))  # Dead reckoning, mu
     
-    Filter = ParticleFilter(DT)
-
-    history = PfHistory(xEst, xTrue)
+    control_model = ControlModel()
+    motion_model = MotionModel()
+    Localization = ParticleFilter(motion_model, DT, Q, R)
+    history = History(mu, pose)
 
 
     while SIM_TIME >= time:
         time += DT
-        u = simulator.calc_input()
+        u = control_model()
 
-        xTrue, z, xDR, ud = Filter.observation(xTrue, xDR, u, RFID)
+        pose, z, xDR, ud = observation(motion_model, pose, xDR, u, RFID)
 
-        xEst, PEst, px, pw = Filter.localization(px, pw, xEst, PEst, z, ud)
+        mu, sigma, px, pw = Localization(px, pw, mu, sigma, z, ud)
 
-        history.update(xEst, xDR, xTrue)
+        history.update(mu, xDR, pose)
 
         if show_animation:
-            history.plot(xEst, PEst, xTrue, z, RFID, px)
+            history.plot(mu, sigma, pose, z, RFID, px)
 
 
 if __name__ == '__main__':

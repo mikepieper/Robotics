@@ -21,35 +21,39 @@ show_animation = True
 
 simulator = Simulator()
 
-# Covariance for UKF simulation
-Q = np.diag([
-    0.1, # variance of location on x-axis
-    0.1, # variance of location on y-axis
-    np.deg2rad(1.0), # variance of yaw angle
-    1.0 # variance of velocity
-    ])**2  # predict state covariance
+
 R = np.diag([1.0, 1.0])**2  # Observation x,y position covariance
 
 DT = 0.1  # time tick [s]
 SIM_TIME = 50.0  # simulation time [s]
+
+
+
+show_animation = True
+
+
+# DEFAULT PARAMS
+R = np.diag([1.0, 1.0])**2  # Observation x,y position covariance
 
 #  UKF Parameter
 ALPHA = 0.001
 BETA = 2
 KAPPA = 0
 
-show_animation = True
-
 class UnscentedKF(KalmanFilter):
 	
-	def __init__(self, DT, Q, R):
-		super().__init__(DT, Q, R)
+	def __init__(self, DT, Q, R=R, alpha=ALPHA, beta=BETA, kappa=KAPPA):
+		self.R = R
+		self.alpha = alpha
+		self.beta = beta
+		self.kappa = kappa
+		super().__init__(DT, Q)
 
 	def setup_ukf(self, nx):
-		lamb = ALPHA ** 2 * (nx + KAPPA) - nx
+		lamb = self.alpha ** 2 * (nx + self.kappa) - nx
 		# calculate weights
 		wm = [lamb / (lamb + nx)]
-		wc = [(lamb / (lamb + nx)) + (1 - ALPHA ** 2 + BETA)]
+		wc = [(lamb / (lamb + nx)) + (1 - self.alpha ** 2 + self.beta)]
 		for i in range(2 * nx):
 			wm.append(1.0 / (2 * (nx + lamb)))
 			wc.append(1.0 / (2 * (nx + lamb)))
